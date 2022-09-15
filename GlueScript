@@ -1,0 +1,78 @@
+import sys
+import boto3
+from pyspark.sql.types import TimestampType
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import unix_timestamp
+import airflowlibrary
+
+args = airflowlibrary.setup_glue_job(sys.argv, ["JOB_NAME",
+                                             "s3_bucket",
+                                             "airflow_execution_dt",
+                                             "airflow_execution_ts",
+                                             "airflow_dag_run_id",
+                                             "SSB_AIRFLOW_ENV",
+                                             "party_model_path",
+                                             "export_path",
+                                             "query_bucket",
+                                             "query_path"])
+
+spark = args['spark']
+glueContext = args['glueContext']
+s3_bucket = args['s3_bucket']
+job = args['job']
+SSB_AIRFLOW_ENV = args["SSB_AIRFLOW_ENV"]
+party_model_path = args['party_model_path']
+export_path = args['export_path']
+query_bucket = args['query_bucket']
+query_path = args['query_path']
+current_folder = args["airflow_execution_dt"]
+
+deposits_detail_folder = f"s3://{s3_bucket}/{party_model_path}/bic_deposit_detail/{current_folder}/"
+export_folder = f"s3://{s3_bucket}/{export_path}/account_tables/fis/{current_folder}/"
+
+//Path to find source table folder in S3
+
+deposits_detail = glueContext.create_dynamic_frame.from_options(
+    format_options={"quoteChar": '"', "withHeader": True, "separator": ","},
+    connection_type="s3",
+    format="csv",
+    connection_options={"paths": [deposits_detail_folder]}, *Change here
+    transformation_ctx="deposits_detail",  *Change here
+) //Pulls data from S3 
+
+s3 = boto3.client('s3')
+fis_query = s3.get_object(Bucket=query_bucket, Key=query_path)
+fis_query_string = fis_query['Body'].read().decode('utf-8')
+
+fis_sql_query = fis_query_string.replace("[FIS_CORE_FEEDS_DM].[dbo].[BIC_DEPOSIT_DETAIL]", "deposits_detail").replace( 
+    "[", "`").replace("]", "`")
+//# Bc in the data memory of glue job must replace source table name with the variable defined above 
+
+fis_accounts = airflowlibrary.sparkSqlQuery(
+    spark,
+    glueContext,
+    query=fis_sql_query,
+    mapping={
+        "daily_deposits": daily_deposits,
+    },
+    transformation_ctx="fis_accounts",
+) // Runs query file
+
+fis_accounts_df = fis_accounts.toDF()
+
+fis_accounts_df = fis_accounts_df.withColumn("start_date", unix_timestamp("start_date", 'MM/dd/yyyy').cast(TimestampType())) //looks for start date column to put it in the right format
+
+fis_accounts_dyf = DynamicFrame.fromDF(fis_accounts_df, glueContext, "accounts_dyf")
+
+fis_accounts_export = glueContext.write_dynamic_frame.from_options(
+    frame=fis_accounts_dyf.repartition(1),
+    connection_type="s3",
+    format="csv",
+    connection_options={
+        "path": export_folder,
+        "partitionKeys": [],
+    },
+    transformation_ctx="fis_accounts_export",
+)
+
+job.commit()
